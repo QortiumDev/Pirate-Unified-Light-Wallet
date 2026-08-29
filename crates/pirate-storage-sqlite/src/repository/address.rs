@@ -89,21 +89,33 @@ pub(super) fn get_next_diversifier_index_for_scope_and_type(
         |row| row.get::<_, i64>(0),
     )?;
 
-    let mut next = 0_u32;
+    let mut lowest_free = 0_u32;
+    let mut next_after_max = 0_u32;
+    let mut has_max = false;
     for row in rows {
         let stored = u32::try_from(row?)
             .map_err(|_| Error::Validation("Stored address sequence is invalid".to_string()))?;
-        if stored < next {
+        if stored == u32::MAX {
+            has_max = true;
             continue;
         }
-        if stored > next {
-            return Ok(next);
+        next_after_max = stored + 1;
+        if stored < lowest_free {
+            continue;
         }
-        next = next
-            .checked_add(1)
-            .ok_or_else(|| Error::Validation("Address sequence is exhausted".to_string()))?;
+        if stored == lowest_free {
+            lowest_free += 1;
+        }
     }
-    Ok(next)
+    if !has_max {
+        return Ok(next_after_max);
+    }
+    if lowest_free == u32::MAX {
+        return Err(Error::Validation(
+            "Address sequence is exhausted".to_string(),
+        ));
+    }
+    Ok(lowest_free)
 }
 
 fn get_next_diversifier_index_88_for_scope_and_type(

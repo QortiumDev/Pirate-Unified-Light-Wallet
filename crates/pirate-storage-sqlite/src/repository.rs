@@ -6472,7 +6472,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.key_id, Some(first.0));
-        assert_eq!(stored.diversifier_index, 3);
+        assert_eq!(stored.diversifier_index, 0);
         assert_eq!(stored.address_type, AddressType::Ironwood);
 
         db.conn()
@@ -6637,7 +6637,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.key_id, Some(first.0));
-        assert_eq!(stored.diversifier_index, 0);
+        assert_eq!(stored.diversifier_index, 7);
         assert_eq!(stored.address_type, AddressType::Sapling);
         assert_eq!(stored.address_scope, AddressScope::External);
     }
