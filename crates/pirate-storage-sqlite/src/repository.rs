@@ -2245,9 +2245,7 @@ impl<'a> Repository<'a> {
                 };
 
             let mut verified_index_be = address.diversifier_index_88.ok_or_else(|| {
-                Error::Validation(
-                    "Verified spending-key address has no ZIP-32 index".to_string(),
-                )
+                Error::Validation("Verified spending-key address has no ZIP-32 index".to_string())
             })?;
             verified_index_be.reverse();
             let verified_index_be = verified_index_be.to_vec();

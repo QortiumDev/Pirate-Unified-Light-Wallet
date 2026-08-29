@@ -2164,20 +2164,18 @@ fn stored_address_is_owned(
     };
 
     match address.address_type {
-        AddressType::Sapling => PaymentAddress::decode_for_network(
-            prefix_network,
-            &address.address,
-        )
-        .ok()
-        .and_then(|decoded| sapling_fvk.diversifier_index(&decoded))
-        .is_some_and(|(_, recovered_scope)| recovered_scope == scope),
-        AddressType::Ironwood => IronwoodPaymentAddress::decode_for_network(
-            prefix_network,
-            &address.address,
-        )
-        .ok()
-        .and_then(|decoded| ironwood_fvk.diversifier_index(&decoded, scope))
-        .is_some(),
+        AddressType::Sapling => {
+            PaymentAddress::decode_for_network(prefix_network, &address.address)
+                .ok()
+                .and_then(|decoded| sapling_fvk.diversifier_index(&decoded))
+                .is_some_and(|(_, recovered_scope)| recovered_scope == scope)
+        }
+        AddressType::Ironwood => {
+            IronwoodPaymentAddress::decode_for_network(prefix_network, &address.address)
+                .ok()
+                .and_then(|decoded| ironwood_fvk.diversifier_index(&decoded, scope))
+                .is_some()
+        }
     }
 }
 
@@ -2233,12 +2231,7 @@ fn infer_key_network_type_from_addresses(
 
         let mut matches = 0usize;
         for addr in &addresses {
-            if stored_address_is_owned(
-                addr,
-                prefix_network,
-                &sapling_fvk,
-                &orchard_fvk,
-            ) {
+            if stored_address_is_owned(addr, prefix_network, &sapling_fvk, &orchard_fvk) {
                 matches += 1;
             }
         }
@@ -4268,13 +4261,10 @@ mod stored_address_ownership_tests {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     fn viewing_keys() -> (ExtendedFullViewingKey, IronwoodExtendedFullViewingKey) {
-        let sapling = ExtendedSpendingKey::from_mnemonic_with_account(
-            MNEMONIC,
-            NetworkType::Mainnet,
-            0,
-        )
-        .unwrap()
-        .to_extended_fvk();
+        let sapling =
+            ExtendedSpendingKey::from_mnemonic_with_account(MNEMONIC, NetworkType::Mainnet, 0)
+                .unwrap()
+                .to_extended_fvk();
         let seed = ExtendedSpendingKey::seed_bytes_from_mnemonic(MNEMONIC).unwrap();
         let network = Network::from_type(NetworkType::Mainnet);
         let ironwood = IronwoodExtendedSpendingKey::master(&seed)
@@ -4332,11 +4322,8 @@ mod stored_address_ownership_tests {
             .address_at_internal_index(index)
             .encode_for_network(NetworkType::Mainnet)
             .unwrap();
-        let mut stored = stored_address(
-            address,
-            AddressType::Ironwood,
-            StoredAddressScope::Internal,
-        );
+        let mut stored =
+            stored_address(address, AddressType::Ironwood, StoredAddressScope::Internal);
 
         assert!(stored_address_is_owned(
             &stored,
