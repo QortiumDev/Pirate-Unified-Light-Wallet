@@ -2250,14 +2250,15 @@ impl<'a> Repository<'a> {
             verified_index_be.reverse();
             let verified_index_be = verified_index_be.to_vec();
 
-            let existing_address: Option<(
+            type ExistingVerifiedAddress = (
                 i64,
                 Option<i64>,
                 i64,
                 String,
                 String,
                 Option<Vec<u8>>,
-            )> = conn
+            );
+            let existing_address: Option<ExistingVerifiedAddress> = conn
                 .query_row(
                     "SELECT account_id, key_id, diversifier_index, address_type, address_scope, diversifier_index_be FROM addresses WHERE address = ?1",
                     [&address.address],
