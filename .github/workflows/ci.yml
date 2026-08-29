@@ -2884,6 +2884,7 @@ jobs:
   ci-success:
     name: CI - All Checks Passed
     runs-on: ubuntu-latest
+    if: ${{ always() }}
     needs:
       - workflow-action-pinning
       - frb-codegen
@@ -2906,11 +2907,46 @@ jobs:
       - package-native-ffi
       - package-ios-sdk
       - package-android-sdk
+      - package-react-native-plugin
+      - verify-react-native-plugin-ios-example
       - package-android
       - package-ios
       - package-windows
       - package-macos
       - package-linux
     steps:
-      - name: All checks passed
-        run: echo "✅ All CI checks passed successfully! Artifacts ready for distribution."
+      - name: Verify required CI outcomes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          allowed_skips = {
+              "package-android",
+              "package-ios",
+              "package-windows",
+              "package-macos",
+              "package-linux",
+          } if os.environ["EVENT_NAME"] == "pull_request" else set()
+
+          invalid = []
+          for job, details in sorted(needs.items()):
+              result = details["result"]
+              if result == "success":
+                  continue
+              if result == "skipped" and job in allowed_skips:
+                  continue
+              invalid.append(f"{job}={result}")
+
+          if invalid:
+              print("Required CI outcomes did not pass:")
+              for outcome in invalid:
+                  print(f"- {outcome}")
+              raise SystemExit(1)
+
+          print("All required CI checks passed successfully.")
+          PY
