@@ -3304,6 +3304,21 @@ impl SyncEngine {
         Ok(outcome.repair_range)
     }
 
+    fn mark_sync_finalizing_without_scan_extrema(
+        spendability: &SpendabilityStateStorage<'_>,
+    ) -> Result<()> {
+        // A current-tip wallet can legitimately have no scan-queue extrema when
+        // its birthday equals the remote tip and there are no blocks to scan.
+        // Keep the independently verified tip recorded by sync startup; zeroing
+        // it here makes verified key imports incorrectly report an unknown tip.
+        let state = spendability.load_state()?;
+        if !state.rescan_required && state.required_rescan_from_height == 0 && !state.repair_queued
+        {
+            spendability.mark_sync_finalizing(state.target_height, state.anchor_height)?;
+        }
+        Ok(())
+    }
+
     fn check_witnesses_with_db(
         sink: &StorageSink,
         current_height: u64,
@@ -3325,7 +3340,7 @@ impl SyncEngine {
             )?
             .map(|(target, anchor_height)| (target.max(1), anchor_height.max(1)))
         else {
-            spendability.mark_sync_finalizing(0, 0)?;
+            Self::mark_sync_finalizing_without_scan_extrema(&spendability)?;
             tracing::debug!(
                 "Skipping witness integrity check at tip {}: scan queue extrema not available yet",
                 current_height
@@ -10134,7 +10149,7 @@ impl SyncEngine {
                 }
             }
         } else {
-            spendability.mark_sync_finalizing(0, 0)?;
+            Self::mark_sync_finalizing_without_scan_extrema(&spendability)?;
         }
         Ok((progress_ms, aux_start.elapsed().as_millis()))
     }
@@ -12069,6 +12084,21 @@ fn trial_decrypt_block(
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn missing_scan_extrema_preserve_an_independently_known_tip() {
+        let (_file, db, _sink) = shardtree_test_database("known-tip", 91);
+        let spendability = SpendabilityStateStorage::new(&db);
+        spendability.mark_sync_finalizing(152_858, 152_858).unwrap();
+
+        SyncEngine::mark_sync_finalizing_without_scan_extrema(&spendability).unwrap();
+
+        let state = spendability.load_state().unwrap();
+        assert_eq!(state.target_height, 152_858);
+        assert_eq!(state.anchor_height, 152_858);
+        assert!(!state.spendable);
+        assert_eq!(state.reason_code, "ERR_SYNC_FINALIZING");
+    }
 
     #[test]
     fn server_info_validation_reserves_extra_time_and_a_fresh_channel_for_i2p() {
