@@ -473,13 +473,23 @@ impl<'a> SpendabilityStateStorage<'a> {
     /// Record an interrupted sync without erasing its last known heights or
     /// any stronger replay/repair gate.
     pub fn mark_sync_interrupted(&self) -> Result<()> {
-        let mut state = self.load_state()?;
-        state.spendable = false;
-        if !state.rescan_required && state.required_rescan_from_height == 0 && !state.repair_queued
-        {
-            state.reason_code = "ERR_SYNC_FINALIZING".to_string();
-        }
-        self.save_state(&state)
+        self.db.conn().execute(
+            r#"
+            UPDATE spendability_state SET
+                spendable = 0,
+                reason_code = CASE
+                    WHEN rescan_required = 0
+                     AND required_rescan_from_height = 0
+                     AND repair_queued = 0
+                    THEN 'ERR_SYNC_FINALIZING'
+                    ELSE reason_code
+                END,
+                updated_at = ?1
+            WHERE id = 1
+            "#,
+            params![chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     /// Mark state as requiring a full rescan.
@@ -854,18 +864,56 @@ mod tests {
     }
 
     #[test]
-    fn sync_interruption_never_zeros_persisted_heights() {
+    fn sync_interruption_preserves_heights_and_marks_an_ordinary_sync_finalizing() {
         let db = test_db();
         let storage = SpendabilityStateStorage::new(&db);
         let mut state = storage.load_state().unwrap();
+        state.spendable = true;
+        state.rescan_required = false;
         state.target_height = 152_860;
         state.anchor_height = 152_850;
+        state.validated_anchor_height = 152_850;
+        state.reason_code = "OK".to_string();
         storage.save_state(&state).unwrap();
 
         storage.mark_sync_interrupted().unwrap();
         let current = storage.load_state().unwrap();
+        assert!(!current.spendable);
+        assert!(!current.rescan_required);
         assert_eq!(current.target_height, 152_860);
         assert_eq!(current.anchor_height, 152_850);
+        assert_eq!(current.validated_anchor_height, 152_850);
+        assert_eq!(current.reason_code, "ERR_SYNC_FINALIZING");
+    }
+
+    #[test]
+    fn sync_interruption_preserves_stronger_replay_and_repair_obligations() {
+        let db = test_db();
+        let storage = SpendabilityStateStorage::new(&db);
+        let mut state = storage.load_state().unwrap();
+        state.spendable = true;
+        state.rescan_required = true;
+        state.target_height = 152_860;
+        state.anchor_height = 152_850;
+        state.validated_anchor_height = 152_840;
+        state.required_rescan_from_height = 152_855;
+        state.key_import_generation = 3;
+        state.repair_queued = true;
+        state.repair_from_height = 152_845;
+        state.reason_code = "ERR_RESCAN_REQUIRED".to_string();
+        storage.save_state(&state).unwrap();
+
+        storage.mark_sync_interrupted().unwrap();
+        let current = storage.load_state().unwrap();
+        assert!(!current.spendable);
         assert!(current.rescan_required);
+        assert_eq!(current.target_height, 152_860);
+        assert_eq!(current.anchor_height, 152_850);
+        assert_eq!(current.validated_anchor_height, 152_840);
+        assert_eq!(current.required_rescan_from_height, 152_855);
+        assert_eq!(current.key_import_generation, 3);
+        assert!(current.repair_queued);
+        assert_eq!(current.repair_from_height, 152_845);
+        assert_eq!(current.reason_code, "ERR_RESCAN_REQUIRED");
     }
 }
