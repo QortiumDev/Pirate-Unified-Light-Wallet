@@ -12140,6 +12140,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_scan_extrema_preserve_a_witness_repair_gate() {
+        let (_file, db, _sink) = shardtree_test_database("known-tip-repair", 93);
+        let spendability = SpendabilityStateStorage::new(&db);
+        spendability.record_known_sync_height(152_858).unwrap();
+        spendability
+            .mark_repair_pending_without_enqueue(152_855, "ERR_WITNESS_REPAIR_QUEUED")
+            .unwrap();
+        let before = spendability.load_state().unwrap();
+        assert_eq!(before.required_rescan_from_height, 0);
+        assert!(before.repair_queued);
+
+        SyncEngine::mark_sync_finalizing_without_scan_extrema(&spendability).unwrap();
+
+        let state = spendability.load_state().unwrap();
+        assert_eq!(state.spendable, before.spendable);
+        assert_eq!(state.rescan_required, before.rescan_required);
+        assert_eq!(
+            state.required_rescan_from_height,
+            before.required_rescan_from_height
+        );
+        assert_eq!(state.key_import_generation, before.key_import_generation);
+        assert_eq!(state.target_height, before.target_height);
+        assert_eq!(state.anchor_height, before.anchor_height);
+        assert_eq!(
+            state.validated_anchor_height,
+            before.validated_anchor_height
+        );
+        assert_eq!(state.repair_queued, before.repair_queued);
+        assert_eq!(state.repair_from_height, before.repair_from_height);
+        assert_eq!(state.reason_code, before.reason_code);
+        assert_eq!(state.updated_at, before.updated_at);
+    }
+
+    #[test]
     fn server_info_validation_reserves_extra_time_and_a_fresh_channel_for_i2p() {
         assert_eq!(
             server_info_validation_policy(TransportMode::I2p),
