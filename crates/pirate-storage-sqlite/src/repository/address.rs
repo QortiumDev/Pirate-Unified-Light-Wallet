@@ -74,6 +74,30 @@ pub(super) fn get_next_diversifier_index_for_scope_and_type(
     scope: AddressScope,
     address_type: AddressType,
 ) -> Result<u32> {
+    let max_index: Option<i64> = repo.db.conn().query_row(
+        "SELECT MAX(diversifier_index) FROM addresses
+         WHERE account_id = ?1 AND key_id = ?2 AND address_scope = ?3 AND address_type = ?4",
+        params![
+            account_id,
+            key_id,
+            address_scope_str(scope),
+            address_type_str(address_type)
+        ],
+        |row| row.get(0),
+    )?;
+
+    let Some(max_index) = max_index else {
+        return Ok(0);
+    };
+    let max_index = u32::try_from(max_index)
+        .map_err(|_| Error::Validation("Stored address sequence is invalid".to_string()))?;
+    if max_index < u32::MAX {
+        return Ok(max_index + 1);
+    }
+
+    // A legacy caller may have supplied u32::MAX as display metadata. Keep
+    // ordinary allocation on the constant-time MAX + 1 path and search for a
+    // free display sequence only for this exceptional poisoned-maximum case.
     let mut statement = repo.db.conn().prepare(
         "SELECT DISTINCT diversifier_index FROM addresses
          WHERE account_id = ?1 AND key_id = ?2 AND address_scope = ?3 AND address_type = ?4
@@ -90,30 +114,18 @@ pub(super) fn get_next_diversifier_index_for_scope_and_type(
     )?;
 
     let mut lowest_free = 0_u32;
-    let mut next_after_max = 0_u32;
-    let mut has_max = false;
     for row in rows {
         let stored = u32::try_from(row?)
             .map_err(|_| Error::Validation("Stored address sequence is invalid".to_string()))?;
-        if stored == u32::MAX {
-            has_max = true;
-            continue;
-        }
-        next_after_max = stored + 1;
         if stored < lowest_free {
             continue;
         }
-        if stored == lowest_free {
-            lowest_free += 1;
+        if stored > lowest_free {
+            return Ok(lowest_free);
         }
-    }
-    if !has_max {
-        return Ok(next_after_max);
-    }
-    if lowest_free == u32::MAX {
-        return Err(Error::Validation(
-            "Address sequence is exhausted".to_string(),
-        ));
+        lowest_free = lowest_free
+            .checked_add(1)
+            .ok_or_else(|| Error::Validation("Address sequence is exhausted".to_string()))?;
     }
     Ok(lowest_free)
 }

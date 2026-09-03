@@ -1,9 +1,14 @@
-Pirate Unified Wallet
+Stashi Wallet
 =====================
 
-Pirate Unified Wallet is a cross-platform Pirate Chain wallet with a Flutter user interface and a Rust core. The repository includes the application, the Rust wallet and sync crates, build scripts, and the project-owned documentation used for release and verification work.
+Stashi Wallet is a cross-platform Pirate Chain wallet with a Flutter user interface and a Rust core. The repository includes the application, the Rust wallet and sync crates, build scripts, and the project-owned documentation used for release and verification work.
 
 This repository is under active development. Before distributing builds, review the release notes, the security notes, and the verification instructions in `docs/`.
+
+User guide
+----------
+
+The [Stashi Wallet User Guide](https://piratenetwork.github.io/Pirate-Unified-Light-Wallet/) covers installation, recovery, payments, privacy, key management, release verification, and troubleshooting for desktop and mobile. Its source is maintained under [`docs/user-guide/`](docs/user-guide/), and GitHub Actions publishes the approved PDF after guide changes reach `main`.
 
 Repository layout
 -----------------
@@ -97,8 +102,8 @@ Toolchain
 The project is built and tested in CI with these pinned versions:
 
 - Rust `1.90.0`
-- Flutter `3.47.0`
-- Dart `3.13.0` (bundled with Flutter)
+- Flutter `3.47.2`
+- Dart `3.13.2` (bundled with Flutter)
 - `flutter_rust_bridge_codegen` `2.11.1`
 - CocoaPods `1.17.0` for macOS and iOS builds
 
@@ -107,8 +112,8 @@ The Rust pin is defined in `rust-toolchain.toml`. CI pins are defined in `.githu
 To check local tools against the current pins:
 
 ```bash
-FLUTTER_VERSION=3.47.0 \
-DART_VERSION=3.13.0 \
+FLUTTER_VERSION=3.47.2 \
+DART_VERSION=3.13.2 \
 COCOAPODS_VERSION=1.17.0 \
 scripts/verify-toolchain.sh
 ```
@@ -256,6 +261,7 @@ cargo test --all-features --locked
 Documentation index
 -------------------
 
+- Stashi Wallet user guide: `docs/user-guide/README.md`
 - Supernova sync engine architecture and performance: `docs/sync-engine.md`
 - Build verification: `docs/verify-build.md`
 - Security notes: `docs/security.md`

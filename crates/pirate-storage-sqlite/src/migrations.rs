@@ -3,7 +3,7 @@
 use crate::{Error, Result};
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i32 = 38;
+const SCHEMA_VERSION: i32 = 40;
 
 /// Run all migrations
 pub fn run_migrations(conn: &Connection) -> Result<()> {
@@ -143,6 +143,12 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
     if current_version < 38 {
         migrate_v38(conn)?;
+    }
+    if current_version < 39 {
+        migrate_v39(conn)?;
+    }
+    if current_version < 40 {
+        migrate_v40(conn)?;
     }
 
     // Only set schema version if it changed (to avoid UNIQUE constraint errors)
@@ -869,6 +875,73 @@ fn migrate_v38(conn: &Connection) -> Result<()> {
         COMMIT;
         "#
     ))
+    .map_err(|e| Error::Migration(e.to_string()))?;
+
+    Ok(())
+}
+
+fn migrate_v39(conn: &Connection) -> Result<()> {
+    // Some early development databases reported a newer schema version while
+    // missing the v33 durable-intent table. Re-run the idempotent prerequisite
+    // so v39 repairs that shape instead of failing wallet startup.
+    migrate_v33(conn)?;
+
+    let mut stmt = conn.prepare("PRAGMA table_info(outgoing_transaction_intents)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let add_expiry_height = if columns.iter().any(|column| column == "expiry_height") {
+        ""
+    } else {
+        "ALTER TABLE outgoing_transaction_intents ADD COLUMN expiry_height INTEGER NOT NULL DEFAULT 0 CHECK (expiry_height >= 0);"
+    };
+
+    conn.execute_batch(&format!(
+        r#"
+        BEGIN IMMEDIATE;
+
+        {add_expiry_height}
+
+        INSERT INTO migration_state (key, value, updated_at)
+        VALUES ('v39_outgoing_transaction_expiry', 'completed', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at;
+
+        COMMIT;
+        "#
+    ))
+    .map_err(|e| Error::Migration(e.to_string()))?;
+
+    Ok(())
+}
+
+fn migrate_v40(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE IF NOT EXISTS signing_key_protection (
+            wallet_id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            kdf_salt BLOB NOT NULL,
+            credential_check BLOB NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signing_key_protection_account
+            ON signing_key_protection(account_id);
+
+        INSERT INTO migration_state (key, value, updated_at)
+        VALUES ('v40_wallet_signing_sessions', 'completed', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at;
+
+        COMMIT;
+        "#,
+    )
     .map_err(|e| Error::Migration(e.to_string()))?;
 
     Ok(())

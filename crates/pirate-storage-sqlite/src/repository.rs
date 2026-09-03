@@ -6,7 +6,7 @@ use crate::address_book::ColorTag;
 use crate::frontier_witness::{
     construct_anchor_witnesses_from_db_state, resolve_orchard_anchor_from_db_state,
 };
-use crate::{models::*, Database, Error, Result};
+use crate::{models::*, spending_protection, Database, Error, MasterKey, Result};
 use pirate_core::keys::{ExtendedSpendingKey, IronwoodExtendedSpendingKey};
 use pirate_core::DEFAULT_FEE;
 use pirate_params::consensus::ConsensusParams;
@@ -287,6 +287,63 @@ impl<'a> Repository<'a> {
         match encrypted {
             Some(e) => self.decrypt_blob(&e).map(Some),
             None => Ok(None),
+        }
+    }
+
+    fn reveal_spending_blob(&self, encrypted: &[u8]) -> Result<Option<Vec<u8>>> {
+        let value = self.decrypt_blob(encrypted)?;
+        spending_protection::reveal_for_active_session(&value)
+    }
+
+    fn reveal_optional_spending_blob(&self, encrypted: Option<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+        match encrypted {
+            Some(value) => self.reveal_spending_blob(&value),
+            None => Ok(None),
+        }
+    }
+
+    fn protected_wallet_for_account(&self, account_id: i64) -> Result<Option<String>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT wallet_id FROM signing_key_protection WHERE account_id = ?1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn encrypt_spending_blob_for_wallet(&self, wallet_id: &str, value: &[u8]) -> Result<Vec<u8>> {
+        let value = if self.get_signing_protection(wallet_id)?.is_some() {
+            spending_protection::protect_for_active_session(wallet_id, value)?
+        } else {
+            value.to_vec()
+        };
+        self.encrypt_blob(&value)
+    }
+
+    fn encrypt_optional_spending_blob_for_wallet(
+        &self,
+        wallet_id: &str,
+        value: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
+        value
+            .map(|value| self.encrypt_spending_blob_for_wallet(wallet_id, value))
+            .transpose()
+    }
+
+    fn encrypt_optional_spending_blob_for_account(
+        &self,
+        account_id: i64,
+        value: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
+        match (self.protected_wallet_for_account(account_id)?, value) {
+            (Some(wallet_id), Some(value)) => self
+                .encrypt_spending_blob_for_wallet(&wallet_id, value)
+                .map(Some),
+            (None, Some(value)) => self.encrypt_blob(value).map(Some),
+            (_, None) => Ok(None),
         }
     }
 
@@ -1125,6 +1182,7 @@ impl<'a> Repository<'a> {
         amount: u64,
         fee: u64,
         broadcast_at: i64,
+        expiry_height: u32,
     ) -> Result<()> {
         let txid = txid_hex.trim().to_ascii_lowercase();
         if txid.len() != 64 || !txid.chars().all(|character| character.is_ascii_hexdigit()) {
@@ -1143,19 +1201,21 @@ impl<'a> Repository<'a> {
         let tx = self.db.conn().unchecked_transaction()?;
         tx.execute(
             "INSERT INTO outgoing_transaction_intents
-                (txid, account_id, amount, fee, broadcast_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                (txid, account_id, amount, fee, broadcast_at, expiry_height)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(txid) DO UPDATE SET
                 account_id = excluded.account_id,
                 amount = excluded.amount,
                 fee = excluded.fee,
-                broadcast_at = excluded.broadcast_at",
+                broadcast_at = excluded.broadcast_at,
+                expiry_height = excluded.expiry_height",
             params![
                 txid,
                 encrypted_account_id,
                 encrypted_amount,
                 encrypted_fee,
-                broadcast_at
+                broadcast_at,
+                expiry_height
             ],
         )?;
         tx.execute(
@@ -1179,7 +1239,7 @@ impl<'a> Repository<'a> {
         account_id: i64,
     ) -> Result<Vec<OutgoingTransactionIntent>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT txid, account_id, amount, fee, broadcast_at
+            "SELECT txid, account_id, amount, fee, broadcast_at, expiry_height
              FROM outgoing_transaction_intents
              ORDER BY broadcast_at DESC, txid DESC",
         )?;
@@ -1191,12 +1251,21 @@ impl<'a> Repository<'a> {
                     row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, u32>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut intents = Vec::new();
-        for (txid, encrypted_account_id, encrypted_amount, encrypted_fee, broadcast_at) in rows {
+        for (
+            txid,
+            encrypted_account_id,
+            encrypted_amount,
+            encrypted_fee,
+            broadcast_at,
+            expiry_height,
+        ) in rows
+        {
             if self.decrypt_int64(&encrypted_account_id)? != account_id {
                 continue;
             }
@@ -1212,9 +1281,147 @@ impl<'a> Repository<'a> {
                     Error::Storage("Stored transaction fee is negative".to_string())
                 })?,
                 broadcast_at,
+                expiry_height,
             });
         }
         Ok(intents)
+    }
+
+    fn outgoing_transaction_is_confirmed(&self, txid: &str) -> Result<bool> {
+        let mut candidates = vec![txid.to_string()];
+        if let Some(reversed) = reverse_txid_hex(txid) {
+            if reversed != txid {
+                candidates.push(reversed);
+            }
+        }
+        Ok(self
+            .get_transaction_heights(&candidates)?
+            .values()
+            .any(|height| *height > 0))
+    }
+
+    /// Give pre-expiry-schema outgoing intents a conservative reconciliation
+    /// height measured from the wallet's stable, locally scanned tip.
+    ///
+    /// Waiting a full transaction lifetime after the upgrade avoids guessing
+    /// the original signing height and prevents a legacy pending entry from
+    /// being released while it could still be mined.
+    pub fn initialize_legacy_outgoing_expiries(
+        &self,
+        account_id: i64,
+        local_height: u64,
+        transaction_lifetime: u32,
+    ) -> Result<u64> {
+        let expiry_height = local_height
+            .saturating_add(u64::from(transaction_lifetime))
+            .min(u64::from(u32::MAX)) as u32;
+        let mut updated = 0u64;
+
+        for intent in self.get_outgoing_transaction_intents(account_id)? {
+            if intent.expiry_height != 0 || self.outgoing_transaction_is_confirmed(&intent.txid)? {
+                continue;
+            }
+            updated = updated.saturating_add(self.db.conn().execute(
+                "UPDATE outgoing_transaction_intents
+                 SET expiry_height = ?1
+                 WHERE txid = ?2 AND expiry_height = 0",
+                params![expiry_height, intent.txid],
+            )? as u64);
+        }
+
+        Ok(updated)
+    }
+
+    /// Release notes locked by wallet-authored transactions that are now
+    /// consensus-invalid because the locally scanned chain passed their expiry
+    /// height without observing a confirmation.
+    pub fn release_expired_outgoing_notes(
+        &self,
+        account_id: i64,
+        local_height: u64,
+    ) -> Result<u64> {
+        let mut expired_txids = std::collections::HashSet::<[u8; 32]>::new();
+        for intent in self.get_outgoing_transaction_intents(account_id)? {
+            if intent.expiry_height == 0
+                || local_height <= u64::from(intent.expiry_height)
+                || self.outgoing_transaction_is_confirmed(&intent.txid)?
+            {
+                continue;
+            }
+            let Ok(mut direct) = hex::decode(&intent.txid) else {
+                continue;
+            };
+            if direct.len() != 32 {
+                continue;
+            }
+            let mut direct_bytes = [0u8; 32];
+            direct_bytes.copy_from_slice(&direct);
+            expired_txids.insert(direct_bytes);
+            direct.reverse();
+            let mut reversed_bytes = [0u8; 32];
+            reversed_bytes.copy_from_slice(&direct);
+            expired_txids.insert(reversed_bytes);
+        }
+        if expired_txids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut stmt = self.db.conn().prepare(
+            "SELECT id, account_id, spent, spent_txid
+             FROM notes
+             WHERE spent_txid IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut release_ids = Vec::new();
+        for (id, encrypted_account_id, encrypted_spent, encrypted_spent_txid) in rows {
+            if self.decrypt_int64(&encrypted_account_id)? != account_id
+                || !self.decrypt_bool(&encrypted_spent)?
+            {
+                continue;
+            }
+            let Some(spent_txid) = self.decrypt_optional_blob(encrypted_spent_txid)? else {
+                continue;
+            };
+            let Ok(spent_txid) = <[u8; 32]>::try_from(spent_txid.as_slice()) else {
+                continue;
+            };
+            if !expired_txids.contains(&spent_txid) {
+                continue;
+            }
+            release_ids.push(id);
+        }
+        if release_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let encrypted_unspent = self.encrypt_bool(false)?;
+        let conn = self.db.conn();
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let mut released = 0u64;
+        for id in release_ids {
+            if let Err(error) = conn.execute(
+                "UPDATE notes SET spent = ?1, spent_txid = NULL WHERE id = ?2",
+                params![encrypted_unspent.clone(), id],
+            ) {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(error.into());
+            }
+            released = released.saturating_add(1);
+        }
+        conn.execute_batch("COMMIT;")?;
+
+        Ok(released)
     }
 
     /// Insert or update an outgoing memo for a transaction.
@@ -1823,12 +2030,18 @@ impl<'a> Repository<'a> {
         Ok(WalletSecret {
             wallet_id: secret.wallet_id.clone(), // Stored plaintext as canonical lookup key
             account_id: secret.account_id,       // Will be encrypted in upsert_wallet_secret
-            extsk: self.encrypt_blob(&secret.extsk)?,
+            extsk: self.encrypt_spending_blob_for_wallet(&secret.wallet_id, &secret.extsk)?,
             dfvk: self.encrypt_optional_blob(secret.dfvk.as_deref())?, // Encrypt viewing key for privacy
-            orchard_extsk: self.encrypt_optional_blob(secret.orchard_extsk.as_deref())?,
+            orchard_extsk: self.encrypt_optional_spending_blob_for_wallet(
+                &secret.wallet_id,
+                secret.orchard_extsk.as_deref(),
+            )?,
             sapling_ivk: self.encrypt_optional_blob(secret.sapling_ivk.as_deref())?, // Encrypt viewing key for privacy
             orchard_ivk: self.encrypt_optional_blob(secret.orchard_ivk.as_deref())?, // Encrypt viewing key for privacy
-            encrypted_mnemonic: self.encrypt_optional_blob(secret.encrypted_mnemonic.as_deref())?,
+            encrypted_mnemonic: self.encrypt_optional_spending_blob_for_wallet(
+                &secret.wallet_id,
+                secret.encrypted_mnemonic.as_deref(),
+            )?,
             mnemonic_language: secret.mnemonic_language.clone(),
             created_at: secret.created_at, // Will be encrypted in upsert_wallet_secret
         })
@@ -1856,12 +2069,14 @@ impl<'a> Repository<'a> {
             let encrypted_created_at: Vec<u8> = row.get(9)?;
 
             let account_id = self.decrypt_int64(&encrypted_account_id)?;
-            let extsk = self.decrypt_blob(&encrypted_extsk)?;
+            let extsk = self
+                .reveal_spending_blob(&encrypted_extsk)?
+                .unwrap_or_default();
             let dfvk = self.decrypt_optional_blob(encrypted_dfvk)?; // Decrypt viewing key for privacy
-            let orchard_extsk = self.decrypt_optional_blob(encrypted_orchard_extsk)?;
+            let orchard_extsk = self.reveal_optional_spending_blob(encrypted_orchard_extsk)?;
             let sapling_ivk = self.decrypt_optional_blob(encrypted_sapling_ivk)?; // Decrypt viewing key for privacy
             let orchard_ivk = self.decrypt_optional_blob(encrypted_orchard_ivk)?; // Decrypt viewing key for privacy
-            let encrypted_mnemonic = self.decrypt_optional_blob(encrypted_mnemonic)?;
+            let encrypted_mnemonic = self.reveal_optional_spending_blob(encrypted_mnemonic)?;
             let created_at = self.decrypt_int64(&encrypted_created_at)?;
 
             return Ok(Some(WalletSecret {
@@ -1879,6 +2094,141 @@ impl<'a> Repository<'a> {
         }
 
         Ok(None)
+    }
+
+    /// Load wallet-scoped signing protection metadata.
+    pub fn get_signing_protection(
+        &self,
+        wallet_id: &str,
+    ) -> Result<Option<SigningProtectionRecord>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT wallet_id, account_id, kdf_salt, credential_check FROM signing_key_protection WHERE wallet_id = ?1",
+                [wallet_id],
+                |row| {
+                    Ok(SigningProtectionRecord {
+                        wallet_id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        kdf_salt: row.get(2)?,
+                        credential_check: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Atomically wrap every spend-capable field for one wallet with a
+    /// wallet-scoped key. Viewing material remains available to sync.
+    pub fn enable_signing_protection(
+        &self,
+        wallet_id: &str,
+        account_id: i64,
+        kdf_salt: &[u8],
+        credential_check: &[u8],
+        signing_key: &MasterKey,
+    ) -> Result<()> {
+        if self.get_signing_protection(wallet_id)?.is_some() {
+            return Err(Error::Validation(
+                "wallet signing protection is already enabled".to_string(),
+            ));
+        }
+
+        let secret = self
+            .get_wallet_secret(wallet_id)?
+            .ok_or_else(|| Error::NotFound(format!("wallet secret {wallet_id}")))?;
+        if secret.account_id != account_id {
+            return Err(Error::Validation(
+                "wallet signing account does not match wallet secret".to_string(),
+            ));
+        }
+        let account_keys = self.get_account_keys(account_id)?;
+        let has_spending_material = !secret.extsk.is_empty()
+            || secret.orchard_extsk.is_some()
+            || secret.encrypted_mnemonic.is_some()
+            || account_keys.iter().any(|key| {
+                key.sapling_extsk.is_some()
+                    || key.orchard_extsk.is_some()
+                    || key.encrypted_mnemonic.is_some()
+            });
+        if !has_spending_material {
+            return Err(Error::Validation(
+                "watch-only wallets have no spending material to protect".to_string(),
+            ));
+        }
+
+        let protect = |value: &[u8]| -> Result<Vec<u8>> {
+            if value.is_empty() {
+                Ok(Vec::new())
+            } else {
+                spending_protection::protect_with_key(wallet_id, signing_key, value)
+            }
+        };
+        let protect_optional =
+            |value: Option<&[u8]>| -> Result<Option<Vec<u8>>> { value.map(protect).transpose() };
+        let encrypted_secret = WalletSecret {
+            wallet_id: secret.wallet_id.clone(),
+            account_id: secret.account_id,
+            extsk: self.encrypt_blob(&protect(&secret.extsk)?)?,
+            dfvk: self.encrypt_optional_blob(secret.dfvk.as_deref())?,
+            orchard_extsk: self.encrypt_optional_blob(
+                protect_optional(secret.orchard_extsk.as_deref())?.as_deref(),
+            )?,
+            sapling_ivk: self.encrypt_optional_blob(secret.sapling_ivk.as_deref())?,
+            orchard_ivk: self.encrypt_optional_blob(secret.orchard_ivk.as_deref())?,
+            encrypted_mnemonic: self.encrypt_optional_blob(
+                protect_optional(secret.encrypted_mnemonic.as_deref())?.as_deref(),
+            )?,
+            mnemonic_language: secret.mnemonic_language.clone(),
+            created_at: secret.created_at,
+        };
+
+        let mut encrypted_keys = Vec::with_capacity(account_keys.len());
+        for key in account_keys {
+            encrypted_keys.push(AccountKey {
+                id: key.id,
+                account_id: key.account_id,
+                key_type: key.key_type,
+                key_scope: key.key_scope,
+                label: key.label,
+                birthday_height: key.birthday_height,
+                created_at: key.created_at,
+                spendable: key.spendable,
+                sapling_extsk: self.encrypt_optional_blob(
+                    protect_optional(key.sapling_extsk.as_deref())?.as_deref(),
+                )?,
+                sapling_dfvk: self.encrypt_optional_blob(key.sapling_dfvk.as_deref())?,
+                orchard_extsk: self.encrypt_optional_blob(
+                    protect_optional(key.orchard_extsk.as_deref())?.as_deref(),
+                )?,
+                orchard_fvk: self.encrypt_optional_blob(key.orchard_fvk.as_deref())?,
+                encrypted_mnemonic: self.encrypt_optional_blob(
+                    protect_optional(key.encrypted_mnemonic.as_deref())?.as_deref(),
+                )?,
+            });
+        }
+
+        let conn = self.db.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.upsert_wallet_secret(&encrypted_secret)?;
+            for key in &encrypted_keys {
+                self.upsert_account_key(key)?;
+            }
+            conn.execute(
+                "INSERT INTO signing_key_protection (wallet_id, account_id, kdf_salt, credential_check) VALUES (?1, ?2, ?3, ?4)",
+                params![wallet_id, account_id, kdf_salt, credential_check],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Reconcile the primary seed key with the wallet secret without discarding
@@ -2416,11 +2766,20 @@ impl<'a> Repository<'a> {
             birthday_height: key.birthday_height,
             created_at: key.created_at,
             spendable: key.spendable,
-            sapling_extsk: self.encrypt_optional_blob(key.sapling_extsk.as_deref())?,
+            sapling_extsk: self.encrypt_optional_spending_blob_for_account(
+                key.account_id,
+                key.sapling_extsk.as_deref(),
+            )?,
             sapling_dfvk: self.encrypt_optional_blob(key.sapling_dfvk.as_deref())?,
-            orchard_extsk: self.encrypt_optional_blob(key.orchard_extsk.as_deref())?,
+            orchard_extsk: self.encrypt_optional_spending_blob_for_account(
+                key.account_id,
+                key.orchard_extsk.as_deref(),
+            )?,
             orchard_fvk: self.encrypt_optional_blob(key.orchard_fvk.as_deref())?,
-            encrypted_mnemonic: self.encrypt_optional_blob(key.encrypted_mnemonic.as_deref())?,
+            encrypted_mnemonic: self.encrypt_optional_spending_blob_for_account(
+                key.account_id,
+                key.encrypted_mnemonic.as_deref(),
+            )?,
         })
     }
 
@@ -2487,11 +2846,11 @@ impl<'a> Repository<'a> {
                 birthday_height,
                 created_at,
                 spendable: spendable_raw != 0,
-                sapling_extsk: self.decrypt_optional_blob(sapling_extsk)?,
+                sapling_extsk: self.reveal_optional_spending_blob(sapling_extsk)?,
                 sapling_dfvk: self.decrypt_optional_blob(sapling_dfvk)?,
-                orchard_extsk: self.decrypt_optional_blob(orchard_extsk)?,
+                orchard_extsk: self.reveal_optional_spending_blob(orchard_extsk)?,
                 orchard_fvk: self.decrypt_optional_blob(orchard_fvk)?,
-                encrypted_mnemonic: self.decrypt_optional_blob(encrypted_mnemonic)?,
+                encrypted_mnemonic: self.reveal_optional_spending_blob(encrypted_mnemonic)?,
             });
         }
 
@@ -2563,11 +2922,11 @@ impl<'a> Repository<'a> {
             birthday_height,
             created_at,
             spendable: spendable_raw != 0,
-            sapling_extsk: self.decrypt_optional_blob(sapling_extsk)?,
+            sapling_extsk: self.reveal_optional_spending_blob(sapling_extsk)?,
             sapling_dfvk: self.decrypt_optional_blob(sapling_dfvk)?,
-            orchard_extsk: self.decrypt_optional_blob(orchard_extsk)?,
+            orchard_extsk: self.reveal_optional_spending_blob(orchard_extsk)?,
             orchard_fvk: self.decrypt_optional_blob(orchard_fvk)?,
-            encrypted_mnemonic: self.decrypt_optional_blob(encrypted_mnemonic)?,
+            encrypted_mnemonic: self.reveal_optional_spending_blob(encrypted_mnemonic)?,
         }))
     }
 
@@ -3781,7 +4140,7 @@ impl<'a> Repository<'a> {
 
     /// Get the next diversifier index for a key group and scope.
     ///
-    /// Returns the lowest unused address sequence, or 0 if no addresses exist.
+    /// Returns the maximum diversifier index used + 1, or 0 if no addresses exist.
     pub fn get_next_diversifier_index_for_scope(
         &self,
         account_id: i64,
@@ -3998,7 +4357,7 @@ impl<'a> Repository<'a> {
         &self,
         account_id: i64,
         limit: Option<u32>,
-        _current_height: u64,
+        current_height: u64,
         _min_depth: u64,
         split_transfers: bool,
     ) -> Result<Vec<TransactionRecord>> {
@@ -4057,6 +4416,7 @@ impl<'a> Repository<'a> {
             intent_amount: Option<i64>,
             intent_fee: Option<u64>,
             intent_broadcast_at: Option<i64>,
+            intent_expiry_height: Option<u32>,
             memo: Option<Vec<u8>>,
             saw_internal: bool,
             saw_unknown_scope: bool,
@@ -4072,6 +4432,7 @@ impl<'a> Repository<'a> {
                     intent_amount: None,
                     intent_fee: None,
                     intent_broadcast_at: None,
+                    intent_expiry_height: None,
                     memo: None,
                     saw_internal: false,
                     saw_unknown_scope: false,
@@ -4228,6 +4589,7 @@ impl<'a> Repository<'a> {
             entry.intent_amount = Some(intent_amount);
             entry.intent_fee = Some(intent.fee);
             entry.intent_broadcast_at = Some(intent.broadcast_at);
+            entry.intent_expiry_height = (intent.expiry_height > 0).then_some(intent.expiry_height);
         }
 
         let txid_keys: Vec<String> = tx_map.keys().cloned().collect();
@@ -4335,6 +4697,10 @@ impl<'a> Repository<'a> {
                 .saturating_sub(fee_i64);
             let outgoing_amount = entry.intent_amount.unwrap_or(chain_outgoing_amount);
             let has_outgoing = entry.sent > 0 || entry.intent_amount.is_some();
+            let expired = entry.height <= 0
+                && entry
+                    .intent_expiry_height
+                    .is_some_and(|height| current_height > u64::from(height));
 
             let can_split = split_transfers
                 && entry.received_external > 0
@@ -4384,6 +4750,8 @@ impl<'a> Repository<'a> {
                     amount: -outgoing_amount,
                     fee,
                     memo: memo.clone(),
+                    expired,
+                    expiry_height: entry.intent_expiry_height,
                 });
                 transactions.push(TransactionRecord {
                     txid,
@@ -4392,6 +4760,8 @@ impl<'a> Repository<'a> {
                     amount: entry.received_external,
                     fee: 0,
                     memo,
+                    expired: false,
+                    expiry_height: None,
                 });
             } else if self_transfer {
                 let transfer_amount = entry.intent_amount.unwrap_or(entry.received_external);
@@ -4402,6 +4772,8 @@ impl<'a> Repository<'a> {
                     amount: -transfer_amount,
                     fee,
                     memo: memo.clone(),
+                    expired,
+                    expiry_height: entry.intent_expiry_height,
                 });
                 transactions.push(TransactionRecord {
                     txid,
@@ -4410,6 +4782,8 @@ impl<'a> Repository<'a> {
                     amount: transfer_amount,
                     fee: 0,
                     memo,
+                    expired: false,
+                    expiry_height: None,
                 });
             } else if entry.intent_amount.is_some() {
                 transactions.push(TransactionRecord {
@@ -4419,6 +4793,8 @@ impl<'a> Repository<'a> {
                     amount: -outgoing_amount,
                     fee,
                     memo,
+                    expired,
+                    expiry_height: entry.intent_expiry_height,
                 });
             } else {
                 transactions.push(TransactionRecord {
@@ -4428,6 +4804,8 @@ impl<'a> Repository<'a> {
                     amount: net_amount,
                     fee,
                     memo,
+                    expired: false,
+                    expiry_height: None,
                 });
             }
         }
@@ -4482,12 +4860,12 @@ impl<'a> Repository<'a> {
         // confirmed chain history. Within each group, retain deterministic
         // newest-first ordering.
         transactions.sort_by(|a, b| {
-            let a_pending = a.height <= 0;
-            let b_pending = b.height <= 0;
+            let a_pending = a.height <= 0 && !a.expired;
+            let b_pending = b.height <= 0 && !b.expired;
             b_pending
                 .cmp(&a_pending)
                 .then_with(|| {
-                    if a_pending && b_pending {
+                    if (a_pending && b_pending) || (a.expired && b.expired) {
                         b.timestamp.cmp(&a.timestamp)
                     } else {
                         b.height.cmp(&a.height)
@@ -6279,9 +6657,8 @@ mod tests {
             )
             .unwrap();
 
-        // The caller's legacy sequence is response/display metadata only. Changing
-        // it on a retry must neither rewrite the internal allocation cursor nor
-        // reopen a completed rescan.
+        // Caller sequence metadata is neither an ownership proof nor an
+        // allocation cursor. A retry must not rewrite storage or reopen replay.
         address.diversifier_index = 1;
         let changed_metadata_retry = repo
             .import_verified_spending_key(
@@ -6307,8 +6684,8 @@ mod tests {
             0
         );
 
-        // A legacy/malformed row missing only the full cursor is repaired without
-        // making already-scanned key material non-spendable again.
+        // Repair missing cursor metadata without changing the established
+        // display sequence or making already-scanned key material unspendable.
         db.conn()
             .execute(
                 "UPDATE addresses SET diversifier_index = ?1, diversifier_index_be = NULL WHERE address = ?2",
@@ -6324,18 +6701,13 @@ mod tests {
             .unwrap();
         assert!(cursor_repair.1);
         assert!(!cursor_repair.3);
+        let repaired = repo
+            .get_address_by_string(account_id, &address.address)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.diversifier_index, u32::MAX);
         assert_eq!(
-            repo.get_address_by_string(account_id, &address.address)
-                .unwrap()
-                .unwrap()
-                .diversifier_index,
-            u32::MAX
-        );
-        assert_eq!(
-            repo.get_address_by_string(account_id, &address.address)
-                .unwrap()
-                .unwrap()
-                .diversifier_index_88,
+            repaired.diversifier_index_88,
             Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         );
         assert_eq!(
@@ -6348,16 +6720,10 @@ mod tests {
             .unwrap(),
             0
         );
-        assert_eq!(
-            crate::SpendabilityStateStorage::new(&db)
-                .load_state()
-                .unwrap()
-                .key_import_generation,
-            first_generation
-        );
         let repaired_state = crate::SpendabilityStateStorage::new(&db)
             .load_state()
             .unwrap();
+        assert_eq!(repaired_state.key_import_generation, first_generation);
         assert!(repaired_state.spendable);
         assert!(!repaired_state.rescan_required);
 
@@ -7461,6 +7827,7 @@ mod tests {
             250_000_000,
             10_000,
             1_700_000_000,
+            4_000_040,
         )
         .unwrap();
 
@@ -7481,6 +7848,7 @@ mod tests {
                 amount: 250_000_000,
                 fee: 10_000,
                 broadcast_at: 1_700_000_000,
+                expiry_height: 4_000_040,
             }]
         );
 
@@ -7527,6 +7895,7 @@ mod tests {
             250_000_000,
             10_000,
             2_000,
+            140,
         )
         .unwrap();
 
@@ -7588,6 +7957,155 @@ mod tests {
     }
 
     #[test]
+    fn expired_outgoing_intent_releases_locked_notes_after_scanned_height_passes_expiry() {
+        let db = test_db();
+        let repo = Repository::new(&db);
+        let account_id = repo
+            .insert_account(&Account {
+                id: None,
+                name: "Expired outgoing intent".to_string(),
+                created_at: 1,
+            })
+            .unwrap();
+        let spend_txid = vec![0x55; 32];
+        let spend_txid_hex = txid_hex_from_bytes(&spend_txid);
+        insert_received_note(
+            &repo,
+            account_id,
+            vec![0x11; 32],
+            NoteType::Sapling,
+            0,
+            500_000_000,
+            100,
+            None,
+            None,
+            false,
+            0x31,
+        );
+        assert!(repo
+            .mark_note_spent_by_nullifier_with_txid(account_id, &[0x31; 32], &spend_txid,)
+            .unwrap());
+        repo.upsert_outgoing_transaction_intent(
+            account_id,
+            &spend_txid_hex,
+            250_000_000,
+            10_000,
+            2_000,
+            140,
+        )
+        .unwrap();
+
+        assert!(repo.get_unspent_notes(account_id).unwrap().is_empty());
+        assert_eq!(
+            repo.release_expired_outgoing_notes(account_id, 140)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.release_expired_outgoing_notes(account_id, 141)
+                .unwrap(),
+            1
+        );
+        assert_eq!(repo.get_unspent_notes(account_id).unwrap().len(), 1);
+
+        let history = repo
+            .get_transactions_with_options(account_id, None, 141, 1, true)
+            .unwrap();
+        let expired = history
+            .iter()
+            .find(|tx| tx.txid == spend_txid_hex)
+            .expect("expired outgoing transaction");
+        assert!(expired.expired);
+        assert_eq!(expired.expiry_height, Some(140));
+    }
+
+    #[test]
+    fn confirmed_outgoing_intent_never_releases_its_spent_notes() {
+        let db = test_db();
+        let repo = Repository::new(&db);
+        let account_id = repo
+            .insert_account(&Account {
+                id: None,
+                name: "Confirmed outgoing intent".to_string(),
+                created_at: 1,
+            })
+            .unwrap();
+        let spend_txid = vec![0x66; 32];
+        let spend_txid_hex = txid_hex_from_bytes(&spend_txid);
+        insert_received_note(
+            &repo,
+            account_id,
+            vec![0x22; 32],
+            NoteType::Sapling,
+            0,
+            500_000_000,
+            100,
+            None,
+            None,
+            false,
+            0x41,
+        );
+        assert!(repo
+            .mark_note_spent_by_nullifier_with_txid(account_id, &[0x41; 32], &spend_txid,)
+            .unwrap());
+        repo.upsert_outgoing_transaction_intent(
+            account_id,
+            &spend_txid_hex,
+            250_000_000,
+            10_000,
+            2_000,
+            140,
+        )
+        .unwrap();
+        repo.upsert_transaction(&spend_txid_hex, 130, 2_100, 10_000)
+            .unwrap();
+
+        assert_eq!(
+            repo.release_expired_outgoing_notes(account_id, 141)
+                .unwrap(),
+            0
+        );
+        assert!(repo.get_unspent_notes(account_id).unwrap().is_empty());
+        let history = repo
+            .get_transactions_with_options(account_id, None, 141, 1, true)
+            .unwrap();
+        let confirmed = history
+            .iter()
+            .find(|tx| tx.txid == spend_txid_hex)
+            .expect("confirmed outgoing transaction");
+        assert!(!confirmed.expired);
+    }
+
+    #[test]
+    fn legacy_outgoing_intent_waits_one_full_lifetime_after_upgrade() {
+        let db = test_db();
+        let repo = Repository::new(&db);
+        let account_id = repo
+            .insert_account(&Account {
+                id: None,
+                name: "Legacy outgoing intent".to_string(),
+                created_at: 1,
+            })
+            .unwrap();
+        let txid = "77".repeat(32);
+        repo.upsert_outgoing_transaction_intent(account_id, &txid, 20, 1, 2_000, 0)
+            .unwrap();
+
+        assert_eq!(
+            repo.initialize_legacy_outgoing_expiries(account_id, 4_000_000, 40)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            repo.initialize_legacy_outgoing_expiries(account_id, 4_000_010, 40)
+                .unwrap(),
+            0
+        );
+        let intents = repo.get_outgoing_transaction_intents(account_id).unwrap();
+        assert_eq!(intents[0].expiry_height, 4_000_040);
+    }
+
+    #[test]
     fn pending_transactions_sort_before_confirmed_history() {
         let db = test_db();
         let repo = Repository::new(&db);
@@ -7616,10 +8134,24 @@ mod tests {
             .unwrap();
         let older_pending = "33".repeat(32);
         let newer_pending = "44".repeat(32);
-        repo.upsert_outgoing_transaction_intent(account_id, &older_pending, 20, 1, 2_000)
-            .unwrap();
-        repo.upsert_outgoing_transaction_intent(account_id, &newer_pending, 30, 1, 3_000)
-            .unwrap();
+        repo.upsert_outgoing_transaction_intent(
+            account_id,
+            &older_pending,
+            20,
+            1,
+            2_000,
+            4_000_040,
+        )
+        .unwrap();
+        repo.upsert_outgoing_transaction_intent(
+            account_id,
+            &newer_pending,
+            30,
+            1,
+            3_000,
+            4_000_040,
+        )
+        .unwrap();
 
         let history = repo
             .get_transactions_with_options(account_id, None, 4_000_000, 1, true)
@@ -8092,45 +8624,58 @@ mod tests {
     }
 
     #[test]
-    fn next_address_sequence_uses_the_lowest_free_value() {
+    fn address_ownership_repair_changes_only_proven_ownership_fields() {
         let db = test_db();
         let repo = Repository::new(&db);
         let account_id = repo
             .insert_account(&Account {
                 id: None,
-                name: "Sequence gaps".to_string(),
+                name: "Ownership repair".to_string(),
                 created_at: 1,
             })
             .unwrap();
-        let key_id = 42_i64;
+        let original = Address {
+            id: None,
+            key_id: None,
+            account_id,
+            diversifier_index: 12,
+            diversifier_index_88: None,
+            address: "zs1ownershiprepair00000000000000000000000000000000000000000".to_string(),
+            address_type: AddressType::Sapling,
+            label: Some("Savings".to_string()),
+            created_at: 123,
+            color_tag: ColorTag::Blue,
+            address_scope: AddressScope::External,
+        };
+        repo.upsert_address(&original).unwrap();
 
-        for (sequence, suffix) in [(0_u32, "zero"), (2_u32, "two"), (u32::MAX, "max")] {
-            repo.upsert_address(&Address {
-                id: None,
-                key_id: Some(key_id),
-                account_id,
-                diversifier_index: sequence,
-                diversifier_index_88: None,
-                address: format!("zs1sequence-{suffix}"),
-                address_type: AddressType::Sapling,
-                label: None,
-                created_at: 1,
-                color_tag: ColorTag::None,
-                address_scope: AddressScope::External,
-            })
+        let mut repaired = original.clone();
+        repaired.key_id = Some(99);
+        repaired.diversifier_index = u32::MAX;
+        repaired.diversifier_index_88 = Some([9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1]);
+        repaired.address_type = AddressType::Ironwood;
+        repaired.label = None;
+        repaired.created_at = 999;
+        repaired.color_tag = ColorTag::Red;
+        repaired.address_scope = AddressScope::Internal;
+        repo.repair_address_ownership(&repaired).unwrap();
+
+        let stored = repo
+            .get_address_by_string(account_id, &original.address)
+            .unwrap()
             .unwrap();
-        }
+        assert_eq!(stored.key_id, Some(99));
+        assert_eq!(stored.address_type, AddressType::Ironwood);
+        assert_eq!(stored.address_scope, AddressScope::Internal);
+        assert_eq!(stored.diversifier_index_88, repaired.diversifier_index_88);
+        assert_eq!(stored.diversifier_index, 12);
+        assert_eq!(stored.label.as_deref(), Some("Savings"));
+        assert_eq!(stored.created_at, 123);
+        assert_eq!(stored.color_tag, ColorTag::Blue);
 
-        assert_eq!(
-            repo.get_next_diversifier_index_for_scope_and_type(
-                account_id,
-                key_id,
-                AddressScope::External,
-                AddressType::Sapling,
-            )
-            .unwrap(),
-            1
-        );
+        let mut unavailable = repaired;
+        unavailable.address = "zs1missingownershiptarget".to_string();
+        assert!(repo.repair_address_ownership(&unavailable).is_err());
     }
 
     #[test]
@@ -8212,6 +8757,77 @@ mod tests {
         assert!(repo
             .set_address_archived(other_account_id, address_id, true)
             .is_err());
+    }
+
+    #[test]
+    fn next_address_sequence_uses_max_path_and_recovers_poisoned_maximum() {
+        let db = test_db();
+        let repo = Repository::new(&db);
+        let account_id = repo
+            .insert_account(&Account {
+                id: None,
+                name: "Address sequence recovery".to_string(),
+                created_at: 1,
+            })
+            .unwrap();
+        let key_id = 42_i64;
+
+        for (sequence, address) in [(3, "zs1sequence-three"), (5, "zs1sequence-five")] {
+            repo.upsert_address(&Address {
+                id: None,
+                key_id: Some(key_id),
+                account_id,
+                diversifier_index: sequence,
+                diversifier_index_88: None,
+                address: address.to_string(),
+                address_type: AddressType::Sapling,
+                label: None,
+                created_at: 1,
+                color_tag: ColorTag::None,
+                address_scope: AddressScope::External,
+            })
+            .unwrap();
+        }
+
+        // Ordinary allocation preserves the established monotonically
+        // increasing display sequence without searching historical gaps.
+        assert_eq!(
+            repo.get_next_diversifier_index_for_scope_and_type(
+                account_id,
+                key_id,
+                AddressScope::External,
+                AddressType::Sapling,
+            )
+            .unwrap(),
+            6
+        );
+
+        repo.upsert_address(&Address {
+            id: None,
+            key_id: Some(key_id),
+            account_id,
+            diversifier_index: u32::MAX,
+            diversifier_index_88: None,
+            address: "zs1sequence-poisoned-max".to_string(),
+            address_type: AddressType::Sapling,
+            label: None,
+            created_at: 1,
+            color_tag: ColorTag::None,
+            address_scope: AddressScope::External,
+        })
+        .unwrap();
+
+        // Only the exceptional maximum value activates gap recovery.
+        assert_eq!(
+            repo.get_next_diversifier_index_for_scope_and_type(
+                account_id,
+                key_id,
+                AddressScope::External,
+                AddressType::Sapling,
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

@@ -19,8 +19,8 @@
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     
     <application
-        android:label="Pirate Wallet"
-        android:name="${applicationName}"
+        android:label="Stashi Wallet"
+        android:name=".StashiApplication"
         android:icon="@mipmap/ic_launcher"
         android:enableOnBackInvokedCallback="true">
         

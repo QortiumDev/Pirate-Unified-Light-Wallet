@@ -34,11 +34,11 @@ mapfile -t secret_fingerprints < <(
     awk -F: '$1 == "fpr" { print $10 }'
 )
 if [[ " ${public_fingerprints[*]} " != *" $EXPECTED_PRIMARY_FINGERPRINT "* ]]; then
-  echo "The repository public key is not the Pirate Unified Wallet release key." >&2
+  echo "The repository public key is not the Stashi Wallet release key." >&2
   exit 1
 fi
 if [[ " ${secret_fingerprints[*]} " != *" $EXPECTED_PRIMARY_FINGERPRINT "* ]]; then
-  echo "The selected private key cannot sign as the Pirate Unified Wallet release key." >&2
+  echo "The selected private key cannot sign as the Stashi Wallet release key." >&2
   exit 1
 fi
 
@@ -61,6 +61,11 @@ CHECKSUM_MANIFEST="$STAGE_DIR/sha256sum-${RELEASE_TAG}.txt"
 mapfile -d '' RELEASE_FILES < <(
   find "$RELEASE_DIR" -maxdepth 1 -type f \
     ! -name 'signatures-*.zip' \
+    ! -name '*.sig' \
+    ! -name 'README' \
+    ! -name 'public_key.asc' \
+    ! -name 'sha256sum-*.txt' \
+    ! -name 'build-payloads-*.txt' \
     -print0 | sort -z
 )
 if [[ ${#RELEASE_FILES[@]} -eq 0 ]]; then
@@ -89,7 +94,7 @@ done
 
 sign_file "$CHECKSUM_MANIFEST" "$CHECKSUM_MANIFEST.sig"
 
-METADATA_ZIP="$RELEASE_DIR/pirate-unified-wallet-release-metadata.zip"
+METADATA_ZIP="$RELEASE_DIR/Stashi-Wallet-release-metadata.zip"
 PAYLOAD_MANIFEST="$STAGE_DIR/build-payloads-${RELEASE_TAG}.txt"
 if [[ -f "$METADATA_ZIP" ]]; then
   python3 - "$METADATA_ZIP" "$PAYLOAD_MANIFEST" <<'PY'
@@ -183,5 +188,9 @@ with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.write(path, path.name)
 PY
 fi
+
+while IFS= read -r -d '' verification_file; do
+  cp -f "$verification_file" "$RELEASE_DIR/$(basename "$verification_file")"
+done < <(find "$STAGE_DIR" -maxdepth 1 -type f -print0)
 
 echo "Created $(basename "$OUTPUT_ZIP") with ${#RELEASE_FILES[@]} signed release files."

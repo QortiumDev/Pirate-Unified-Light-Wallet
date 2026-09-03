@@ -247,6 +247,19 @@ pub struct WalletSecret {
     pub created_at: i64,
 }
 
+/// Metadata for an opt-in wallet-scoped signing credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningProtectionRecord {
+    /// Wallet protected by the credential.
+    pub wallet_id: String,
+    /// Wallet account whose spending material is protected.
+    pub account_id: i64,
+    /// Argon2id salt used to derive the session encryption key.
+    pub kdf_salt: Vec<u8>,
+    /// Authenticated ciphertext used to verify a supplied credential.
+    pub credential_check: Vec<u8>,
+}
+
 /// Transaction record for querying transaction history
 #[derive(Debug, Clone)]
 pub struct TransactionRecord {
@@ -262,6 +275,11 @@ pub struct TransactionRecord {
     pub fee: u64,
     /// Memo (from first note with memo)
     pub memo: Option<Vec<u8>>,
+    /// Whether the locally scanned chain passed this transaction's expiry height
+    /// without observing a confirmation.
+    pub expired: bool,
+    /// Consensus expiry height for wallet-authored transactions.
+    pub expiry_height: Option<u32>,
 }
 
 /// Wallet-authored details retained independently of chain-derived state.
@@ -277,4 +295,9 @@ pub struct OutgoingTransactionIntent {
     pub fee: u64,
     /// Unix timestamp recorded after a successful broadcast.
     pub broadcast_at: i64,
+    /// Consensus height after which an unmined transaction is invalid.
+    ///
+    /// Zero is reserved for intents written by wallet versions that did not
+    /// persist this value.
+    pub expiry_height: u32,
 }
