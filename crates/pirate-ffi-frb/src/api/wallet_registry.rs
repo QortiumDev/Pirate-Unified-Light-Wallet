@@ -201,71 +201,6 @@ pub(super) fn list_wallets() -> Result<Vec<WalletMeta>> {
     }
 }
 
-pub(super) fn switch_wallet(wallet_id: WalletId) -> Result<()> {
-    if panic_duress::is_decoy_mode_active() {
-        panic_duress::ensure_decoy_wallet_state();
-        return Ok(());
-    }
-    ensure_wallet_registry_loaded()?;
-    {
-        let wallets = WALLETS.read();
-        if !wallets.iter().any(|w| w.id == wallet_id) {
-            return Err(anyhow!("Wallet not found: {}", wallet_id));
-        }
-    }
-
-    let previous_active = ACTIVE_WALLET.read().clone();
-    if let Some(previous_wallet_id) = previous_active.as_ref() {
-        if previous_wallet_id != &wallet_id {
-            let previous_wallet_id = previous_wallet_id.clone();
-            let cancel_result = run_on_runtime_blocking({
-                let wallet_id_for_cancel = previous_wallet_id.clone();
-                move || async move {
-                    sync_control::cancel_sync_internal(wallet_id_for_cancel.clone(), true).await?;
-                    Ok(())
-                }
-            });
-
-            pirate_core::debug_log::with_locked_file(|file| {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let _ = writeln!(
-                    file,
-                    r#"{{"id":"log_wallet_switch_cancel","timestamp":{},"location":"api.rs:switch_wallet","message":"wallet switch previous sync cancel","data":{{"previous_wallet_id":"{}","next_wallet_id":"{}","success":{},"error":"{}"}},"sessionId":"debug-session","runId":"run1","hypothesisId":"W"}}"#,
-                    ts,
-                    previous_wallet_id,
-                    wallet_id,
-                    cancel_result.is_ok(),
-                    cancel_result
-                        .as_ref()
-                        .err()
-                        .map(|e| truncate_for_log(&e.to_string(), 180))
-                        .unwrap_or_default()
-                );
-            });
-
-            if let Err(e) = cancel_result {
-                tracing::warn!(
-                    "Failed to cancel previous wallet sync during switch ({} -> {}): {}",
-                    previous_wallet_id,
-                    wallet_id,
-                    e
-                );
-            }
-        }
-    }
-
-    *ACTIVE_WALLET.write() = Some(wallet_id);
-    let registry_db = open_wallet_registry()?;
-    set_active_wallet_registry(&registry_db, ACTIVE_WALLET.read().as_deref())?;
-    if let Some(active) = ACTIVE_WALLET.read().clone() {
-        touch_wallet_last_used(&registry_db, &active)?;
-    }
-    Ok(())
-}
-
 pub(super) fn get_auto_consolidation_enabled(wallet_id: WalletId) -> Result<bool> {
     ensure_wallet_registry_loaded()?;
     auto_consolidation_enabled(&wallet_id)
@@ -324,54 +259,5 @@ pub(super) fn set_wallet_birthday_height(wallet_id: WalletId, birthday_height: u
 
     let registry_db = open_wallet_registry()?;
     persist_wallet_meta(&registry_db, meta)?;
-    Ok(())
-}
-
-pub(super) fn delete_wallet(wallet_id: WalletId) -> Result<()> {
-    ensure_wallet_registry_loaded()?;
-
-    let mut wallets = WALLETS.write();
-    let Some(index) = wallets.iter().position(|w| w.id == wallet_id) else {
-        return Err(anyhow!("Wallet not found: {}", wallet_id));
-    };
-    wallets.remove(index);
-
-    {
-        let registry_db = open_wallet_registry()?;
-        delete_wallet_meta(&registry_db, &wallet_id)?;
-        let endpoint_key = format!("lightd_endpoint_{}", wallet_id);
-        let pin_key = format!("lightd_tls_pin_{}", wallet_id);
-        set_registry_setting(&registry_db, &endpoint_key, None)?;
-        set_registry_setting(&registry_db, &pin_key, None)?;
-
-        if ACTIVE_WALLET.read().as_ref() == Some(&wallet_id) {
-            let next_active = wallets.first().map(|w| w.id.clone());
-            *ACTIVE_WALLET.write() = next_active.clone();
-            set_active_wallet_registry(&registry_db, next_active.as_deref())?;
-            if let Some(active) = next_active {
-                touch_wallet_last_used(&registry_db, &active)?;
-            }
-        }
-    }
-
-    sync_control::clear_wallet_sync_state(&wallet_id);
-
-    endpoint::remove_cached_lightd_endpoint(&wallet_id);
-
-    let db_path = wallet_db_path_for(&wallet_id)?;
-    let _ = fs::remove_file(db_path);
-    let _ = fs::remove_file(wallet_db_salt_path(&wallet_id)?);
-    let _ = fs::remove_file(wallet_db_key_path(&wallet_id)?);
-
-    if wallets.is_empty() {
-        *ACTIVE_WALLET.write() = None;
-        passphrase_store::clear_passphrase();
-        REGISTRY_LOADED.store(false, Ordering::SeqCst);
-
-        let _ = fs::remove_file(wallet_registry_path()?);
-        let _ = fs::remove_file(wallet_registry_salt_path()?);
-        let _ = fs::remove_file(wallet_registry_key_path()?);
-    }
-
     Ok(())
 }

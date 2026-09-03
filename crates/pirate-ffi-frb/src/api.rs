@@ -73,7 +73,6 @@ pub(crate) mod key_management;
 pub(crate) mod panic_duress;
 pub(crate) mod provisioning;
 pub(crate) mod seed_export;
-pub(crate) mod sync_control;
 pub(crate) mod tunnel;
 pub(crate) mod tx_flow;
 pub(crate) mod wallet_registry;
