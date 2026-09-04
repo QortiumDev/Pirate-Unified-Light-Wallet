@@ -2634,7 +2634,22 @@ jobs:
           set -euo pipefail
           bash scripts/collect-github-release-assets.sh release-artifacts release
 
+      - name: Check release signing key
+        id: signing
+        env:
+          RELEASE_GPG_PRIVATE_KEY_B64: ${{ secrets.LINUX_GPG_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_GPG_PRIVATE_KEY_B64" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing key present"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No LINUX_GPG_PRIVATE_KEY_B64 secret — publishing UNSIGNED assets (fork build)"
+          fi
+
       - name: Import Stashi Wallet release signing key
+        if: steps.signing.outputs.enabled == 'true'
         env:
           RELEASE_GPG_PRIVATE_KEY_B64: ${{ secrets.LINUX_GPG_PRIVATE_KEY_B64 }}
         run: |
@@ -2668,6 +2683,7 @@ jobs:
           fi
 
       - name: Create Treasure Chest compatible signature bundle
+        if: steps.signing.outputs.enabled == 'true'
         env:
           GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
           GPG_SIGNING_KEY: E4FB2399AECCF9B9447DED472CE65343401553A6
